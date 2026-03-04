@@ -31,7 +31,6 @@ A reliable diagnosis workflow:
 
 * Back up all important data (you already did — good).
 * Have a second machine available (for downloads and writing Live USB images).
-* If you keep macOS patches (OpenCore/OCLP) on the Mac’s EFI, be aware they may have altered firmware/boot behavior. See OCLP docs before modifying EFI. OpenCore Legacy Patcher
 
 ---
 
@@ -394,7 +393,6 @@ Document these common confusions so others don’t get stuck:
 
 * GRUB CLI (`grub>`): you can type `exit` or `reboot`. To permanently show the GRUB menu on boot, edit `/etc/default/grub` and set `GRUB_TIMEOUT_STYLE=menu`, then `sudo update-grub`. (We ran into this while trying to run memtest.)
 * Which memtest to pick on a Mac: pick `Memory test (memtest86+x64.efi)` — **not** the serial console variant — because Macs use UEFI.
-* `Revert Root Patches` in OpenCore Legacy Patcher: newer OCLP UI versions (2.x) may not show a one-click “Revert” button; instead the workflow is to use Post-Install routines and, if needed, rename the `/EFI/OC` folder to disable OpenCore. (Important when diagnosing macOS-side freezes before switching to Linux.)
 * Wayland vs Xorg: Wayland can hang older AMD GPUs on Linux; switching at login (gear icon) to Xorg often resolves freezing symptoms immediately.
 * Kernel cmdline flags differ by driver:
 
