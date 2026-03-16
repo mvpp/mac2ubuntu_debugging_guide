@@ -1,6 +1,6 @@
 # Debugging Ubuntu on a Mac — a practical, field-tested guide
 
-Based on a real troubleshooting session with a 27" Late-2015 iMac, here’s a *thorough*, step-by-step tutorial you can upload to GitHub. It covers how to narrow down and fix freezes on Ubuntu (desktop or server installs) running on Apple hardware, with useful commands, notes where clarification was needed during the session, and concrete fixes that worked.
+Based on a real troubleshooting session with a 27" Late-2015 iMac, here’s a *thorough*, step-by-step tutorial you can follow. It covers how to narrow down and fix freezes on Ubuntu (desktop or server installs) running on Apple hardware, with useful commands, notes where clarification was needed during the session, and concrete fixes that worked.
 
 Entities referenced (one each): Ubuntu, iMac (27-inch, Late 2015)
 
