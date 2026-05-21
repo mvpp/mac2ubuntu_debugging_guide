@@ -7,7 +7,9 @@ PCI ID `1002:6640`.
 **OS:** Ubuntu 24.04 LTS, kernel 6.17.0-29-generic.
 
 **Symptom investigated:** browsing GPU-accelerated web pages (heavy WebGL,
-animated 3D backgrounds) → instant black screen → forced hard reboot.
+animated 3D backgrounds, or h.264 video-bearing pages) → instant black screen
+→ forced hard reboot, sometimes followed by a recovery boot that itself fails
+to train the eDP display link.
 
 This document captures the full diagnostic path, dead-ends, and the
 final layered fix. Useful for anyone with the same iMac generation, and
@@ -20,11 +22,13 @@ for future-me if symptoms recur after a kernel/Mesa/Chrome upgrade.
 Three layered changes, in order of importance:
 
 1. **Kernel cmdline** (`/etc/default/grub`):
-   `GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"`
+   `GRUB_CMDLINE_LINUX_DEFAULT="quiet splash radeon.uvd=0"`
    — *no* `radeon.dpm=0`, *no* `radeon.runpm=0`, *no* `pcie_aspm=off`.
+   `radeon.uvd=0` disables the hardware video decoder (see Bug 3 below);
+   video decode falls back to CPU, which is fine on this i5/i7.
 2. **Kernel driver:** legacy `radeon` (amdgpu does not work on this Apple-firmware Bonaire — see Dead Ends below).
 3. **Chrome launch flags:** `--disable-webgl --disable-webgl2`
-   — kills only WebGL; compositing, video decode, raster stay on GPU.
+   — kills only WebGL; compositing, raster stay on GPU.
 
 Firefox is the fallback for the rare site that genuinely needs WebGL —
 it uses a different rendering path that does not trigger the bug.
@@ -33,7 +37,8 @@ it uses a different rendering path that does not trigger the bug.
 
 ## Layered root cause
 
-The original failure mode was actually **two unrelated GPU bugs stacked**:
+The full failure surface turned out to be **three unrelated GPU bugs stacked**.
+Each was diagnosed and fixed in turn:
 
 ### Bug 1 — Thermal/clock stress from disabled DPM
 
@@ -73,6 +78,61 @@ combination cannot compile/run safely for certain shader patterns
 **Fix:** disable WebGL only in Chrome via launch flag.
 Compositing, video, raster stay GPU-accelerated.
 
+### Bug 3 — UVD (hardware video decode) ring lockup on h.264
+
+After Bugs 1+2 were fixed, https://www.slickcharts.com/sp500 (and presumably
+any page Chrome decides to h.264-decode through VA-API) still triggered an
+instant black screen + need for a full power-off. Aquarium/Codex/YouTube
+were all unaffected — different code path.
+
+Crash signature in the journal:
+
+```
+chrome: failed initializing VaapiWrapper for profile h264 main
+radeon 0000:01:00.0: ring 5 stalled for more than 10058msec
+radeon 0000:01:00.0: GPU lockup (... on ring 5)
+radeon 0000:01:00.0: GPU reset succeeded, trying to resume
+[drm:atom_op_jump] atombios stuck in loop for more than 5secs aborting
+[drm:ci_dpm_enable] ci_start_dpm failed
+[drm:radeon_pm_resume] radeon: dpm resume failed
+[drm:radeon_dp_link_train_cr] displayport link status failed / clock recovery failed
+[drm:radeon_uvd_cs_msg] Invalid UVD handle 0x...!
+chrome: GPU process exited unexpectedly: exit_code=8704
+```
+
+**Ring 5 on CIK = UVD** (Unified Video Decoder). What happens:
+
+1. Chrome tries to decode an h.264 stream via VA-API → UVD engine
+2. UVD engine on this Apple-firmware Bonaire wedges (matches the original-state
+   boot's `UVD not responding, giving up!!!` — UVD on this hardware has been
+   chronically fragile across kernel versions)
+3. Driver tries `GPU reset`; ATOMBIOS (the AMD BIOS scripting interpreter)
+   hangs during the reset path; DPM can't restart; eDP link training fails
+4. The GPU stays in a wedged state across a warm reboot → next boot also fails
+   with DP link errors. Only a full **cold power cycle** clears it.
+
+Note that YouTube is not affected even on this same hardware: YouTube serves
+VP9 (and increasingly AV1), and Bonaire's UVD can only h/w-decode h.264,
+MPEG-2, VC-1 — so VP9/AV1 already runs on the CPU. The class of pages that
+trigger UVD is "modern site with an embedded h.264 video or h.264 ad".
+
+**Fix:** disable UVD at the kernel module level so nothing on the system can
+hit it:
+
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash radeon.uvd=0"
+```
+
+Then `sudo update-grub && sudo reboot`. After reboot, journalctl shows VCE
+still initialized but no UVD lines, and ring 5 is no longer allocated.
+
+VCE (video *encode*) is left enabled since it was never implicated and Chrome
+already reports `Video Encode: Software only` anyway.
+
+A Chrome-only equivalent (`--disable-features=VaapiVideoDecoder`) also works
+but is narrower — it only protects Chrome. The kernel-level disable also
+covers Firefox, mpv, VLC, Flatpak apps, and any future tool. Recommended.
+
 ---
 
 ## Diagnostic methodology that worked
@@ -93,11 +153,18 @@ Compositing, video, raster stay GPU-accelerated.
    Key signatures to look for:
    - `ring N stalled for more than ... msec` → GPU lockup on engine N
    - `GPU lockup (current fence id ...)` → confirmed lockup
+   - Ring → engine mapping on CIK Bonaire:
+     `0=GFX, 1–2=compute, 3=DMA0, 4=DMA1, 5=UVD, 6=VCE0, 7=VCE1`
    - `Failed to schedule IB` → command buffer submission failed
    - `[drm:radeon_gem_va_update_vm] BO_VA (-4)` → -EINTR, usually benign noise
    - `[drm:ci_dpm_set_power_state] ci_upload_dpm_level_enable_mask failed`
      → DPM state transition failed (logged but non-fatal on CIK Bonaire)
    - `[drm:uvd_v1_0_start] UVD not responding` → video decode engine init failed
+   - `[drm:radeon_uvd_cs_msg] Invalid UVD handle` plus `chrome: failed
+     initializing VaapiWrapper for profile h264` → Bug 3 fingerprint
+   - `atombios stuck in loop for more than 5secs` + `dpm resume failed` +
+     `displayport link status failed` → GPU reset cascade failure; needs
+     cold power-off to clear
 
 3. **Check current power state under load**
 
@@ -177,9 +244,9 @@ Starting from a system in the broken state (`radeon.dpm=0` set, GPU
 lockups under WebGL):
 
 ```bash
-# --- 1. Clean kernel cmdline ---
+# --- 1. Clean kernel cmdline + disable UVD ---
 sudo cp -a /etc/default/grub /etc/default/grub.bak-$(date +%Y%m%d-%H%M%S)
-sudo sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"|' /etc/default/grub
+sudo sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash radeon.uvd=0"|' /etc/default/grub
 
 # --- 2. Make sure radeon is NOT blacklisted (only if a previous amdgpu attempt left one) ---
 sudo rm -f /etc/modprobe.d/blacklist-radeon.conf
@@ -203,17 +270,20 @@ Post-reboot verification:
 
 ```bash
 lspci -nnk | grep -A3 VGA                 # expect: Kernel driver in use: radeon
-cat /proc/cmdline                          # expect ONLY: quiet splash (+ BOOT_IMAGE etc)
+cat /proc/cmdline                          # expect: ...quiet splash radeon.uvd=0...
 cat /sys/class/drm/card1/device/power_dpm_state                  # expect: balanced
 cat /sys/class/drm/card1/device/power_dpm_force_performance_level  # expect: auto
 journalctl -k -b 0 | grep -iE 'gpu lockup|ring.*stall' | head    # expect: nothing
+journalctl -k -b 0 | grep -iE 'uvd|vce' | head                   # expect: VCE only, no UVD
+ls /sys/class/drm/card1/device/                                  # fence drivers: rings 0–4,6,7 (no ring 5)
 ```
 
 Stress test:
 
 - WebGL: https://webglsamples.org/aquarium/aquarium.html with 1000 fish — should run for >15 min without lockup
-- Video: any 4K YouTube fullscreen for >5 min — should run without UVD errors
+- Video: 4K YouTube fullscreen for >5 min — should run cleanly (CPU decode of VP9; no UVD involved)
 - Chrome `--disable-webgl --disable-webgl2` + https://openai.com/codex/ — page renders without 3D background, no crash
+- Chrome `--disable-webgl --disable-webgl2` + https://www.slickcharts.com/sp500 — page loads cleanly (Bug 3 repro target)
 - Firefox + https://openai.com/codex/ — full 3D background renders, no crash
 
 ---
@@ -251,12 +321,16 @@ cat /sys/class/drm/card1/device/hwmon/hwmon*/temp1_input
 
 ## Future escalation if symptoms return
 
-If a future Mesa/kernel/Chrome update breaks even WebGL-disabled Chrome:
+If a future Mesa/kernel/Chrome update breaks even WebGL-disabled / UVD-off Chrome:
 
 - **First**: re-check `chrome://gpu` to see what changed in Chrome's pipeline.
   Some Chrome updates add new GPU-accelerated features that may bypass the
   WebGL disable.
-- **Second**: try forcing a fixed DPM state to avoid the `ci_dpm` transition bug:
+- **Second**: layer the Chrome-side video decode disable on top of the
+  kernel-side one — add `--disable-features=VaapiVideoDecoder` to the Chrome
+  launcher. Belt-and-suspenders against any future code path that
+  re-discovers some other broken decode engine.
+- **Third**: try forcing a fixed DPM state to avoid the `ci_dpm` transition bug:
   `echo low > /sys/class/drm/card1/device/power_dpm_force_performance_level`
   (make persistent via udev rule or systemd unit if it helps).
 - **Last resort (full GPU acceleration restored)**: try amdgpu with the
